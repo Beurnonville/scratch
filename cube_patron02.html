@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Patron du Cube — Pliage 3D</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Playfair+Display:wght@700&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#d8ddd8; color:#1a1a1a; font-family:'Space Mono',monospace; overflow:hidden; height:100vh; width:100vw; }
+  canvas { display:block; }
+  .ui-panel {
+    position:fixed; bottom:32px; left:50%; transform:translateX(-50%);
+    display:flex; gap:16px; align-items:center;
+    background:rgba(255,255,255,0.75); border:1px solid rgba(0,0,0,0.15);
+    padding:16px 24px; backdrop-filter:blur(12px); z-index:100;
+  }
+  .btn {
+    font-family:'Space Mono',monospace; font-size:11px; letter-spacing:0.15em;
+    text-transform:uppercase; padding:10px 20px; cursor:pointer;
+    border:1px solid rgba(0,0,0,0.3); background:transparent; color:#1a1a1a;
+    transition:all 0.2s; white-space:nowrap;
+  }
+  .btn:hover { background:rgba(0,0,0,0.08); border-color:rgba(0,0,0,0.6); }
+  .btn.primary { background:#1a1a1a; color:#f0f0f0; border-color:#1a1a1a; }
+  .btn.primary:hover { background:#333; }
+  .btn:disabled { opacity:0.3; cursor:not-allowed; }
+  .separator { width:1px; height:28px; background:rgba(0,0,0,0.15); }
+  .title-block { position:fixed; top:28px; left:32px; z-index:100; }
+  .title-block h1 { font-family:'Playfair Display',serif; font-size:22px; font-weight:700; }
+  .title-block p { font-size:10px; letter-spacing:0.2em; text-transform:uppercase; color:rgba(0,0,0,0.45); margin-top:4px; }
+  .hint { position:fixed; top:28px; right:32px; text-align:right; font-size:10px; letter-spacing:0.12em; color:rgba(0,0,0,0.35); line-height:2; z-index:100; }
+  .progress-bar { position:fixed; bottom:0; left:0; height:2px; background:#1a1a1a; z-index:200; }
+  #fold-label { font-size:10px; letter-spacing:0.15em; color:rgba(0,0,0,0.5); min-width:80px; text-align:center; }
+</style>
+</head>
+<body>
+<div class="title-block"><h1>Patron du Cube</h1><p>Pliage interactif 3D</p></div>
+<div class="hint">Glisser pour tourner<br>Molette pour zoomer<br>Clic droit pour déplacer</div>
+<div id="canvas-container"></div>
+<div class="ui-panel">
+  <button class="btn primary" id="btn-fold">Plier le cube</button>
+  <div class="separator"></div>
+  <button class="btn" id="btn-unfold">Déplier</button>
+  <div class="separator"></div>
+  <span id="fold-label">Déplié</span>
+</div>
+<div class="progress-bar" id="progress-bar" style="width:0%"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ── RENDERER ──────────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0xd8ddd8);
+document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.01, 100);
+camera.position.set(0, 0, 6);
+camera.lookAt(0, 0, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+const dl = new THREE.DirectionalLight(0xfff8f0, 0.45); dl.position.set(4,6,5); scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0xddeeff, 0.15); dl2.position.set(-4,-2,-4); scene.add(dl2);
+
+// ── TEXTURES ──────────────────────────────────────────────────────────────────
+// Chaque grande face = 2×2 petites cases colorées teal ou blanc
+// pattern = [TL, TR, BL, BR]  'T'=teal  'W'=blanc
+const TEAL  = '#1a8a8a';
+const WHITE = '#f0ebe0';
+const BORDER = '#111';
+
+function makePatternTex(pattern) {
+  const sz=256, h=sz/2, bw=2;
+  const c=document.createElement('canvas'); c.width=c.height=sz;
+  const ctx=c.getContext('2d');
+  // 4 sous-cases : TL, TR, BL, BR
+  [[0,0],[h,0],[0,h],[h,h]].forEach(([x,y],i) => {
+    ctx.fillStyle = pattern[i]==='T' ? TEAL : WHITE;
+    ctx.fillRect(x, y, h, h);
+  });
+  // Croix centrale (séparation des sous-cases)
+  ctx.strokeStyle=BORDER; ctx.lineWidth=bw;
+  ctx.beginPath(); ctx.moveTo(h,0); ctx.lineTo(h,sz); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,h); ctx.lineTo(sz,h); ctx.stroke();
+  // Contour extérieur
+  ctx.lineWidth=bw*1.5;
+  ctx.strokeRect(bw*0.75, bw*0.75, sz-bw*1.5, sz-bw*1.5);
+  return new THREE.CanvasTexture(c);
+}
+
+// Motifs des 6 grandes faces (lus depuis l'image) :
+//   FA GC(2,0) : damier teal          T W / W T
+//   FB GC(0,1) : tout blanc            W W / W W
+//   FC GC(1,1) : colonne gauche teal  T W / T W
+//   FD GC(2,1) : ligne haute teal      T T / W W
+//   FE GC(1,2) : ligne haute teal      T T / W W
+//   FF GC(1,3) : ligne basse teal      W W / T T
+const texFA = makePatternTex(['T','W','W','T']);
+const texFB = makePatternTex(['W','W','W','W']);
+const texFC = makePatternTex(['T','W','T','W']);
+const texFD = makePatternTex(['T','T','W','W']);
+const texFE = makePatternTex(['T','T','W','W']);
+const texFF = makePatternTex(['W','W','T','T']);
+
+// ── FACE MESH ─────────────────────────────────────────────────────────────────
+const faceGeo = new THREE.PlaneGeometry(0.999, 0.999);
+function makeFace(tex) {
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(faceGeo, new THREE.MeshLambertMaterial({ map:tex, side:THREE.FrontSide })));
+  const back = new THREE.Mesh(faceGeo, new THREE.MeshLambertMaterial({ color:0xcfc8b8, side:THREE.FrontSide }));
+  back.rotation.y=Math.PI; back.position.z=-0.001;
+  g.add(back);
+  return g;
+}
+
+// ── PATRON ET HIÉRARCHIE ──────────────────────────────────────────────────────
+//
+// Patron (en grandes cases, centré sur FC) :
+//
+//              FA(+1,+1)
+//  FB(-1,0)  FC(0,0)  FD(+1,0)
+//              FE(0,-1)
+//              FF(0,-2)
+//
+// Arbre de pliage depuis FC (AVANT +Z) :
+//   FC → FB  hinge x=-0.5, axe Y, angle +π/2
+//   FC → FD  hinge x=+0.5, axe Y, angle -π/2
+//     FD → FA  hinge y=+0.5 (dans FD), axe X, angle +π/2
+//   FC → FE  hinge y=-0.5, axe X, angle -π/2
+//     FE → FF  hinge y=-0.5 (dans FE), axe X, angle -π/2
+//
+// Angles vérifiés numériquement (score=0), cube centré en (0,0,-0.5)
+
+const orbitGroup = new THREE.Group();
+scene.add(orbitGroup);
+
+function makeHinge(parentFace, hingePos, faceOffset, tex) {
+  const hinge = new THREE.Group();
+  hinge.position.copy(hingePos);
+  parentFace.add(hinge);
+  const face = makeFace(tex);
+  face.position.copy(faceOffset);
+  hinge.add(face);
+  return { hinge, face };
+}
+
+// FC : ancre
+const fC = makeFace(texFC);
+orbitGroup.add(fC);
+
+// FB : arête gauche de FC
+const { hinge: hB, face: fB } = makeHinge(fC,
+  new THREE.Vector3(-0.5, 0, 0), new THREE.Vector3(-0.5, 0, 0), texFB);
+
+// FD : arête droite de FC
+const { hinge: hD, face: fD } = makeHinge(fC,
+  new THREE.Vector3(0.5, 0, 0), new THREE.Vector3(0.5, 0, 0), texFD);
+
+// FA : arête haute de FD
+const { hinge: hA, face: fA } = makeHinge(fD,
+  new THREE.Vector3(0, 0.5, 0), new THREE.Vector3(0, 0.5, 0), texFA);
+
+// FE : arête basse de FC
+const { hinge: hE, face: fE } = makeHinge(fC,
+  new THREE.Vector3(0, -0.5, 0), new THREE.Vector3(0, -0.5, 0), texFE);
+
+// FF : arête basse de FE
+const { hinge: hF, face: fF } = makeHinge(fE,
+  new THREE.Vector3(0, -0.5, 0), new THREE.Vector3(0, -0.5, 0), texFF);
+
+// ── ANGLES DE PLIAGE (vérifiés numériquement, score=0) ────────────────────────
+const HINGES = [
+  { h: hB, axis:'y', angle: -Math.PI/2 },
+  { h: hD, axis:'y', angle: +Math.PI/2 },
+  { h: hA, axis:'x', angle: -Math.PI/2 },
+  { h: hE, axis:'x', angle: +Math.PI/2 },
+  { h: hF, axis:'x', angle: +Math.PI/2 },
+];
+
+// Cube centré en (0,0,+0.5) → compenser avec (0,0,-0.5)
+const orbitPosFlat   = new THREE.Vector3(0, 0,  0);
+const orbitPosFolded = new THREE.Vector3(0, 0, -0.5);
+
+// ── ANIMATION ─────────────────────────────────────────────────────────────────
+let foldT=0, targetT=0;
+const SPEED=1.3;
+function smoothStep(t){ return t*t*(3-2*t); }
+function applyT(raw) {
+  const t=smoothStep(Math.max(0,Math.min(1,raw)));
+  HINGES.forEach(({h,axis,angle}) => {
+    if(axis==='x') h.rotation.x=angle*t;
+    else           h.rotation.y=angle*t;
+  });
+  orbitGroup.position.lerpVectors(orbitPosFlat, orbitPosFolded, t);
+}
+
+// ── ORBIT CONTROLS ────────────────────────────────────────────────────────────
+const dom=renderer.domElement;
+let drag=false, rightDrag=false, lx=0, ly=0, panX=0, panY=0, zoom=5.6;
+const qCurrent=new THREE.Quaternion();
+qCurrent.setFromEuler(new THREE.Euler(0.3,-0.4,0,'YXZ'));
+
+function applyDelta(dx,dy){
+  const s=0.007;
+  qCurrent.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0),dx*s));
+  qCurrent.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0),dy*s));
+}
+dom.addEventListener('mousedown',e=>{drag=true;rightDrag=e.button===2;lx=e.clientX;ly=e.clientY;});
+dom.addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('mouseup',()=>drag=false);
+addEventListener('mousemove',e=>{
+  if(!drag) return;
+  const dx=e.clientX-lx,dy=e.clientY-ly;
+  if(rightDrag){panX+=dx*0.008;panY-=dy*0.008;} else applyDelta(dx,dy);
+  lx=e.clientX;ly=e.clientY;
+});
+dom.addEventListener('wheel',e=>{zoom=Math.max(2,Math.min(13,zoom+e.deltaY*0.004));},{passive:true});
+dom.addEventListener('touchstart',e=>{drag=true;lx=e.touches[0].clientX;ly=e.touches[0].clientY;},{passive:true});
+addEventListener('touchend',()=>drag=false);
+addEventListener('touchmove',e=>{
+  if(!drag) return;
+  applyDelta(e.touches[0].clientX-lx,e.touches[0].clientY-ly);
+  lx=e.touches[0].clientX;ly=e.touches[0].clientY;
+},{passive:true});
+
+// ── UI ────────────────────────────────────────────────────────────────────────
+const btnFold=document.getElementById('btn-fold');
+const btnUnfold=document.getElementById('btn-unfold');
+const foldLabel=document.getElementById('fold-label');
+const progressBar=document.getElementById('progress-bar');
+btnFold.addEventListener('click',()=>targetT=1);
+btnUnfold.addEventListener('click',()=>targetT=0);
+btnUnfold.disabled=true;
+
+// ── RENDER LOOP ───────────────────────────────────────────────────────────────
+const clock=new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=Math.min(clock.getDelta(),0.05);
+  const diff=targetT-foldT;
+  foldT+=Math.sign(diff)*Math.min(Math.abs(diff),SPEED*dt);
+  if(Math.abs(diff)<0.0001) foldT=targetT;
+  applyT(foldT);
+  const pct=Math.round(foldT*100);
+  progressBar.style.width=pct+'%';
+  if(foldT<0.01){foldLabel.textContent='Déplié';btnFold.disabled=false;btnUnfold.disabled=true;}
+  else if(foldT>0.99){foldLabel.textContent='Plié';btnFold.disabled=true;btnUnfold.disabled=false;}
+  else{foldLabel.textContent=pct+'%';btnFold.disabled=false;btnUnfold.disabled=false;}
+  orbitGroup.quaternion.copy(qCurrent);
+  camera.position.set(panX,panY,zoom);
+  camera.lookAt(panX,panY,0);
+  renderer.render(scene,camera);
+}
+animate();
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>

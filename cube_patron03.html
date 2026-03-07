@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Patron du Cube — Pliage 3D</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Playfair+Display:wght@700&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#d8ddd8; color:#1a1a1a; font-family:'Space Mono',monospace; overflow:hidden; height:100vh; width:100vw; }
+  canvas { display:block; }
+  .ui-panel {
+    position:fixed; bottom:32px; left:50%; transform:translateX(-50%);
+    display:flex; gap:16px; align-items:center;
+    background:rgba(255,255,255,0.75); border:1px solid rgba(0,0,0,0.15);
+    padding:16px 24px; backdrop-filter:blur(12px); z-index:100;
+  }
+  .btn {
+    font-family:'Space Mono',monospace; font-size:11px; letter-spacing:0.15em;
+    text-transform:uppercase; padding:10px 20px; cursor:pointer;
+    border:1px solid rgba(0,0,0,0.3); background:transparent; color:#1a1a1a;
+    transition:all 0.2s; white-space:nowrap;
+  }
+  .btn:hover { background:rgba(0,0,0,0.08); border-color:rgba(0,0,0,0.6); }
+  .btn.primary { background:#1a1a1a; color:#f0f0f0; border-color:#1a1a1a; }
+  .btn.primary:hover { background:#333; }
+  .btn:disabled { opacity:0.3; cursor:not-allowed; }
+  .separator { width:1px; height:28px; background:rgba(0,0,0,0.15); }
+  .title-block { position:fixed; top:28px; left:32px; z-index:100; }
+  .title-block h1 { font-family:'Playfair Display',serif; font-size:22px; font-weight:700; }
+  .title-block p { font-size:10px; letter-spacing:0.2em; text-transform:uppercase; color:rgba(0,0,0,0.45); margin-top:4px; }
+  .hint { position:fixed; top:28px; right:32px; text-align:right; font-size:10px; letter-spacing:0.12em; color:rgba(0,0,0,0.35); line-height:2; z-index:100; }
+  .progress-bar { position:fixed; bottom:0; left:0; height:2px; background:#1a1a1a; z-index:200; }
+  #fold-label { font-size:10px; letter-spacing:0.15em; color:rgba(0,0,0,0.5); min-width:80px; text-align:center; }
+</style>
+</head>
+<body>
+<div class="title-block"><h1>Patron du Cube</h1><p>Pliage interactif 3D</p></div>
+<div class="hint">Glisser pour tourner<br>Molette pour zoomer<br>Clic droit pour déplacer</div>
+<div id="canvas-container"></div>
+<div class="ui-panel">
+  <button class="btn primary" id="btn-fold">Plier le cube</button>
+  <div class="separator"></div>
+  <button class="btn" id="btn-unfold">Déplier</button>
+  <div class="separator"></div>
+  <span id="fold-label">Déplié</span>
+</div>
+<div class="progress-bar" id="progress-bar" style="width:0%"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ── RENDERER ──────────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0xd8ddd8);
+document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.01, 100);
+camera.position.set(0, 0, 6);
+camera.lookAt(0, 0, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+const dl = new THREE.DirectionalLight(0xfff8f0, 0.45); dl.position.set(4,6,5); scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0xddeeff, 0.15); dl2.position.set(-4,-2,-4); scene.add(dl2);
+
+// ── TEXTURES ──────────────────────────────────────────────────────────────────
+const SZ = 512;
+const BG  = '#f8f5ee';
+const BORDER = '#222';
+
+function makeCtx() {
+  const c = document.createElement('canvas'); c.width = c.height = SZ;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, SZ, SZ);
+  return { c, ctx };
+}
+function outline(ctx) {
+  ctx.strokeStyle = BORDER; ctx.lineWidth = 3;
+  ctx.strokeRect(1.5, 1.5, SZ-3, SZ-3);
+}
+function toTex(c) {
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
+// FA : Jaune — damier simple 2×2 (TL=jaune, TR=blanc, BL=blanc, BR=jaune)
+const texJaune = (() => {
+  const {c,ctx} = makeCtx();
+  const Y = '#f0f06a', h = SZ/2;
+  ctx.fillStyle = Y;
+  ctx.fillRect(0, 0, h, h);   // TL
+  ctx.fillRect(h, h, h, h);   // BR
+  ctx.strokeStyle = BORDER; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(h,0); ctx.lineTo(h,SZ); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,h); ctx.lineTo(SZ,h); ctx.stroke();
+  outline(ctx);
+  return toTex(c);
+})();
+
+// FS : Saumon — 2 triangles rectangles, sommet commun = centre, autres sommets = milieux des arêtes
+// Triangle 1 : centre(h,h) + milieu arête haute(h,0) + milieu arête droite(SZ,h)
+// Triangle 2 : centre(h,h) + milieu arête basse(h,SZ) + milieu arête gauche(0,h)
+const texSaumon = (() => {
+  const {c,ctx} = makeCtx();
+  const S = '#f0a882', h = SZ/2;
+  ctx.fillStyle = S;
+  ctx.beginPath(); ctx.moveTo(h,h); ctx.lineTo(h,0); ctx.lineTo(SZ,h); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(h,h); ctx.lineTo(h,SZ); ctx.lineTo(0,h); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = BORDER; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(h,0); ctx.lineTo(h,SZ); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,h); ctx.lineTo(SZ,h); ctx.stroke();
+  outline(ctx);
+  return toTex(c);
+})();
+
+// FT : Teal clair — grand triangle pointe en bas (base en haut) — inchangé
+const texTeal = (() => {
+  const {c,ctx} = makeCtx();
+  const T = '#8fc4b8';
+  ctx.fillStyle = T;
+  ctx.beginPath();
+  ctx.moveTo(0, 0); ctx.lineTo(SZ, 0); ctx.lineTo(SZ/2, SZ);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = BORDER; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(SZ/2,0); ctx.lineTo(SZ/2,SZ); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,SZ/2); ctx.lineTo(SZ,SZ/2); ctx.stroke();
+  outline(ctx);
+  return toTex(c);
+})();
+
+// FV : Verte — losange dont les sommets sont les milieux des arêtes
+const texVerte = (() => {
+  const {c,ctx} = makeCtx();
+  const G = '#80e090', h = SZ/2;
+  ctx.fillStyle = G;
+  ctx.beginPath();
+  ctx.moveTo(h, 0);    // milieu arête haute
+  ctx.lineTo(SZ, h);   // milieu arête droite
+  ctx.lineTo(h, SZ);   // milieu arête basse
+  ctx.lineTo(0, h);    // milieu arête gauche
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = BORDER; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(SZ/2,0); ctx.lineTo(SZ/2,SZ); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,SZ/2); ctx.lineTo(SZ,SZ/2); ctx.stroke();
+  outline(ctx);
+  return toTex(c);
+})();
+
+// FB : Bleue claire — symétrie centrale du triangle précédent
+// Ancien : (0,SZ), (h,0), (SZ,h)
+// Symétrie centrale par rapport à (h,h) : P' = (SZ-x, SZ-y)
+// → (SZ,0), (h,SZ), (0,h)
+const texBleue = (() => {
+  const {c,ctx} = makeCtx();
+  const B = '#a8c8f0', h = SZ/2;
+  ctx.fillStyle = B;
+  ctx.beginPath();
+  ctx.moveTo(SZ, 0);   // coin haut-droit
+  ctx.lineTo(h, SZ);   // milieu arête basse
+  ctx.lineTo(0, h);    // milieu arête gauche
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = BORDER; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(SZ/2,0); ctx.lineTo(SZ/2,SZ); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,SZ/2); ctx.lineTo(SZ,SZ/2); ctx.stroke();
+  outline(ctx);
+  return toTex(c);
+})();
+
+// FJV : Jaune-vert — X formé de 4 triangles pointant vers le centre
+// Chaque triangle part d'un côté (base) et pointe vers le centre (SZ/2, SZ/2)
+const texJV = (() => {
+  const {c,ctx} = makeCtx();
+  const JV = '#c8d870', h = SZ/2;
+  ctx.fillStyle = JV;
+  // Triangle depuis le bas (base=bord bas, pointe=centre)
+  ctx.beginPath(); ctx.moveTo(0,SZ); ctx.lineTo(SZ,SZ); ctx.lineTo(h,h); ctx.closePath(); ctx.fill();
+  // Triangle depuis le haut (base=bord haut, pointe=centre)
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(SZ,0); ctx.lineTo(h,h); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = BORDER; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(h,0); ctx.lineTo(h,SZ); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,h); ctx.lineTo(SZ,h); ctx.stroke();
+  // Diagonales du X
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(SZ,SZ); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(SZ,0); ctx.lineTo(0,SZ); ctx.stroke();
+  outline(ctx);
+  return toTex(c);
+})();
+
+// ── FACE MESH ─────────────────────────────────────────────────────────────────
+const faceGeo = new THREE.PlaneGeometry(0.999, 0.999);
+function makeFace(tex) {
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(faceGeo, new THREE.MeshLambertMaterial({ map:tex, side:THREE.FrontSide })));
+  const back = new THREE.Mesh(faceGeo, new THREE.MeshLambertMaterial({ color:0xcfc8b8, side:THREE.FrontSide }));
+  back.rotation.y = Math.PI; back.position.z = -0.001;
+  g.add(back);
+  return g;
+}
+
+// ── PATRON ET HIÉRARCHIE ──────────────────────────────────────────────────────
+//
+// Patron (grandes cases) :
+//              [jaune  (2,0)]
+// [saumon(1,1)][teal   (2,1)]
+// [verte (0,2)][bleue  (1,2)] ← ANCRE
+//              [jv     (1,3)]
+//
+// Positions relatives à bleue (0,0) :
+//   verte   : (-1,  0)
+//   saumon  : ( 0, +1)  ← ATTENTION : saumon est en (1,1), bleue en (1,2)
+//                         donc saumon est AU-DESSUS de bleue
+//   teal    : (+1, +1)  ← teal est à droite de saumon
+//   jaune   : (+1, +2)  ← jaune est au-dessus de teal
+//   jv      : ( 0, -1)  ← jv est en dessous de bleue
+//
+// Arbre de pliage :
+//   bleue (ANCRE, AVANT +Z)
+//   ├─ verte    : hinge x=-0.5 de bleue, axe Y, sV=+1
+//   ├─ saumon   : hinge y=+0.5 de bleue, axe X, sS=+1
+//   │   └─ teal : hinge x=+0.5 de saumon, axe Y, sT=-1
+//   │       └─ jaune : hinge y=+0.5 de teal, axe X, sJ=+1
+//   └─ jv       : hinge y=-0.5 de bleue, axe X, sJV=-1
+//
+// Angles vérifiés numériquement (score=0)
+// Centre cube = (0, 0, -0.5) → orbitPosFolded = (0, 0, +0.5)
+// MAIS on inverse tous les angles pour que les motifs soient à l'extérieur :
+// sV=-1, sS=-1, sT=+1, sJ=-1, sJV=+1
+// → nouveau centre = (0, 0, +0.5) → orbitPosFolded = (0, 0, -0.5)
+
+const orbitGroup = new THREE.Group();
+scene.add(orbitGroup);
+
+function makeHinge(parentFace, hingePos, faceOffset, tex) {
+  const hinge = new THREE.Group();
+  hinge.position.copy(hingePos);
+  parentFace.add(hinge);
+  const face = makeFace(tex);
+  face.position.copy(faceOffset);
+  hinge.add(face);
+  return { hinge, face };
+}
+
+// Ancre : bleue
+const fB = makeFace(texBleue);
+orbitGroup.add(fB);
+
+// Verte : arête gauche de bleue
+const { hinge: hV, face: fV } = makeHinge(fB,
+  new THREE.Vector3(-0.5, 0, 0), new THREE.Vector3(-0.5, 0, 0), texVerte);
+
+// Saumon : arête haute de bleue
+const { hinge: hS, face: fS } = makeHinge(fB,
+  new THREE.Vector3(0, 0.5, 0), new THREE.Vector3(0, 0.5, 0), texSaumon);
+
+// Teal : arête droite de saumon
+const { hinge: hT, face: fT } = makeHinge(fS,
+  new THREE.Vector3(0.5, 0, 0), new THREE.Vector3(0.5, 0, 0), texTeal);
+
+// Jaune : arête haute de teal
+const { hinge: hJ, face: fJ } = makeHinge(fT,
+  new THREE.Vector3(0, 0.5, 0), new THREE.Vector3(0, 0.5, 0), texJaune);
+
+// JV : arête basse de bleue
+const { hinge: hJV, face: fJV } = makeHinge(fB,
+  new THREE.Vector3(0, -0.5, 0), new THREE.Vector3(0, -0.5, 0), texJV);
+
+// Angles (inversés pour motifs à l'extérieur)
+const HINGES = [
+  { h: hV,  axis:'y', angle: -Math.PI/2 },
+  { h: hS,  axis:'x', angle: -Math.PI/2 },
+  { h: hT,  axis:'y', angle: +Math.PI/2 },
+  { h: hJ,  axis:'x', angle: -Math.PI/2 },
+  { h: hJV, axis:'x', angle: +Math.PI/2 },
+];
+
+const orbitPosFlat   = new THREE.Vector3(0, 0,  0);
+const orbitPosFolded = new THREE.Vector3(0, 0, -0.5);
+
+// ── ANIMATION ─────────────────────────────────────────────────────────────────
+let foldT=0, targetT=0;
+const SPEED=1.3;
+function smoothStep(t){ return t*t*(3-2*t); }
+function applyT(raw) {
+  const t=smoothStep(Math.max(0,Math.min(1,raw)));
+  HINGES.forEach(({h,axis,angle}) => {
+    if(axis==='x') h.rotation.x=angle*t;
+    else           h.rotation.y=angle*t;
+  });
+  orbitGroup.position.lerpVectors(orbitPosFlat, orbitPosFolded, t);
+}
+
+// ── ORBIT CONTROLS ────────────────────────────────────────────────────────────
+const dom=renderer.domElement;
+let drag=false, rightDrag=false, lx=0, ly=0, panX=0, panY=0, zoom=5.6;
+const qCurrent=new THREE.Quaternion();
+qCurrent.setFromEuler(new THREE.Euler(0.3,-0.4,0,'YXZ'));
+
+function applyDelta(dx,dy){
+  const s=0.007;
+  qCurrent.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0),dx*s));
+  qCurrent.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0),dy*s));
+}
+dom.addEventListener('mousedown',e=>{drag=true;rightDrag=e.button===2;lx=e.clientX;ly=e.clientY;});
+dom.addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('mouseup',()=>drag=false);
+addEventListener('mousemove',e=>{
+  if(!drag) return;
+  const dx=e.clientX-lx,dy=e.clientY-ly;
+  if(rightDrag){panX+=dx*0.008;panY-=dy*0.008;} else applyDelta(dx,dy);
+  lx=e.clientX;ly=e.clientY;
+});
+dom.addEventListener('wheel',e=>{zoom=Math.max(2,Math.min(13,zoom+e.deltaY*0.004));},{passive:true});
+dom.addEventListener('touchstart',e=>{drag=true;lx=e.touches[0].clientX;ly=e.touches[0].clientY;},{passive:true});
+addEventListener('touchend',()=>drag=false);
+addEventListener('touchmove',e=>{
+  if(!drag) return;
+  applyDelta(e.touches[0].clientX-lx,e.touches[0].clientY-ly);
+  lx=e.touches[0].clientX;ly=e.touches[0].clientY;
+},{passive:true});
+
+// ── UI ────────────────────────────────────────────────────────────────────────
+const btnFold=document.getElementById('btn-fold');
+const btnUnfold=document.getElementById('btn-unfold');
+const foldLabel=document.getElementById('fold-label');
+const progressBar=document.getElementById('progress-bar');
+btnFold.addEventListener('click',()=>targetT=1);
+btnUnfold.addEventListener('click',()=>targetT=0);
+btnUnfold.disabled=true;
+
+// ── RENDER LOOP ───────────────────────────────────────────────────────────────
+const clock=new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=Math.min(clock.getDelta(),0.05);
+  const diff=targetT-foldT;
+  foldT+=Math.sign(diff)*Math.min(Math.abs(diff),SPEED*dt);
+  if(Math.abs(diff)<0.0001) foldT=targetT;
+  applyT(foldT);
+  const pct=Math.round(foldT*100);
+  progressBar.style.width=pct+'%';
+  if(foldT<0.01){foldLabel.textContent='Déplié';btnFold.disabled=false;btnUnfold.disabled=true;}
+  else if(foldT>0.99){foldLabel.textContent='Plié';btnFold.disabled=true;btnUnfold.disabled=false;}
+  else{foldLabel.textContent=pct+'%';btnFold.disabled=false;btnUnfold.disabled=false;}
+  orbitGroup.quaternion.copy(qCurrent);
+  camera.position.set(panX,panY,zoom);
+  camera.lookAt(panX,panY,0);
+  renderer.render(scene,camera);
+}
+animate();
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>
